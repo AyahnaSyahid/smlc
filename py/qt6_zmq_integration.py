@@ -15,7 +15,8 @@ import logging
 
 # Import Node class dari file sebelumnya
 # Asumsi: improved_node_claude.py ada di folder yang sama
-from improved_node_claude import Node, MessageType
+from improved_node_claude_grok import Node, MessageType
+# from fixed_local_node import Node, MessageType
 
 # ============================================================================
 # WORKER OBJECT - Bridge antara ZeroMQ threads dan Qt GUI thread
@@ -91,7 +92,7 @@ class NodeWorker(QObject):
         self.previous_peers = current_peers
         
         # Check transfer progress
-        outgoing, incoming = self.node.get_active_transfers()
+        outgoing, incoming = self.node.get_transfer_status()
         
         for transfer_id, info in outgoing.items():
             self.transfer_progress.emit(
@@ -498,6 +499,11 @@ def main():
     4. Use signals/slots untuk cross-thread communication
     5. Cleanup di closeEvent
     """
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
     app = QApplication(sys.argv)
     
     # Set application style (optional)

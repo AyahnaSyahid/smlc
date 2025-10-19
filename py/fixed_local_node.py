@@ -533,8 +533,8 @@ class Node:
                 with self.groups_lock:
                     if group_name and group_name not in self.groups:
                         return
-                
                 logger.info(f"📢 Group [{group_name}] from {source}: {content}")
+                
             
             elif msg_type == MessageType.DIRECT:
                 logger.info(f"💬 Direct from {source}: {content}")

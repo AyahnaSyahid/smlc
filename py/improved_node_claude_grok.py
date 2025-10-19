@@ -36,6 +36,7 @@ class MessageType(Enum):
     OPERATION = "operation"
     FOLDER_SHARE = "folder_share"
     FILE_INIT = "file_init"
+    FILE_INIT_ACK = "file_init_ack"  # BARU: Acknowledgment
     CHUNK_REQUEST = "chunk_request"
     CHUNK_RESPONSE = "chunk_response"
     TRANSFER_COMPLETE = "transfer_complete"
@@ -71,6 +72,7 @@ class TransferState:
     chunks_sent: Set[int] = field(default_factory=set)
     last_activity: float = field(default_factory=time.time)
     start_time: float = field(default_factory=time.time)
+    init_confirmed: bool = False  # BARU: Track konfirmasi FILE_INIT
     
     def get_progress(self) -> float:
         """Calculate progress percentage"""
@@ -95,12 +97,15 @@ class ReceiveState:
     sender_node: str
     temp_path: Path
     received_chunks: Dict[int, bytes] = field(default_factory=dict)
-    requested_chunks: Set[int] = field(default_factory=set)
+    requested_chunks: Dict[int, float] = field(default_factory=dict)
     chunk_md5s: Dict[int, str] = field(default_factory=dict)
     retry_count: Dict[int, int] = field(default_factory=dict)
     last_activity: float = field(default_factory=time.time)
     start_time: float = field(default_factory=time.time)
     max_retries: int = 3
+    window_size: int = 20
+    in_flight: int = 0
+    success_count: int = 0
     
     def get_progress(self) -> float:
         """Calculate progress percentage"""
@@ -139,7 +144,7 @@ class Node:
         router_port: int = 0,
         file_port: int = 0,
         discovery_port: int = 5557,
-        chunk_size: int = 524288,  # 512KB default
+        chunk_size: int = 524288,
         max_concurrent_transfers: int = 5
     ):
         # ====================================================================
@@ -168,7 +173,11 @@ class Node:
         self.receiving_transfers: Dict[str, ReceiveState] = {}
         self.receiving_lock = threading.Lock()
         
+        # FIX 1: Initialize chunk_threads dictionary
+        self.chunk_threads: Dict[str, threading.Thread] = {}
+        
         self.transfer_semaphore = threading.Semaphore(max_concurrent_transfers)
+        self.receive_semaphore = threading.Semaphore(max_concurrent_transfers)
         
         # ====================================================================
         # ZEROMQ SETUP
@@ -407,7 +416,6 @@ class Node:
                             
                             if is_new:
                                 try:
-                                    # PERBAIKAN: Connect ke pub_port PEER, bukan self.pub_port
                                     self.sub_socket.connect(f"tcp://{info['ip']}:{info['pub_port']}")
                                     logger.info(f"Discovered local peer: {node_id}")
                                 except Exception as e:
@@ -473,7 +481,6 @@ class Node:
                         self.peers[peer["node_id"]] = peer_info
                         
                         if is_new:
-                            # PERBAIKAN: Connect ke pub_port PEER
                             self.sub_socket.connect(f"tcp://{peer['ip']}:{peer_info.pub_port}")
                             logger.info(f"Discovered peer: {peer['node_id']} at {peer['ip']}")
                 
@@ -513,22 +520,43 @@ class Node:
                     try:
                         frames = self.router_socket.recv_multipart(flags=zmq.NOBLOCK)
                         if len(frames) >= 2:
-                            sender_id = frames[0]
+                            # FIX 2: Extract proper sender_id from message
+                            dealer_identity = frames[0]  # ZMQ identity (random)
                             msg = json.loads(frames[1].decode())
-                            self._handle_message(msg, sender_id)
+                            
+                            # Get actual node_id from message source
+                            sender_node_id = msg.get("source")
+                            
+                            # Update peer last_seen
+                            if sender_node_id:
+                                with self.peers_lock:
+                                    if sender_node_id in self.peers:
+                                        self.peers[sender_node_id].last_seen = time.time()
+                            
+                            # Pass both identities
+                            self._handle_message(msg, dealer_identity, sender_node_id)
                     except zmq.ZMQError as e:
                         logger.error(f"Error receiving from router: {e}")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON in message: {e}")
             
             except Exception as e:
                 if self.running:
                     logger.error(f"Receive error: {e}")
 
-    def _handle_message(self, msg: dict, sender_id: Optional[bytes] = None):
+    def _handle_message(
+        self, 
+        msg: dict, 
+        dealer_identity: Optional[bytes] = None,
+        sender_node_id: Optional[str] = None
+    ):
         """Process incoming messages"""
         try:
             msg_type = MessageType(msg.get("type"))
-            source = msg.get("source")
+            source = msg.get("source", sender_node_id)
             content = msg.get("content")
+
+            logger.info(f"{msg_type.value} from {source}")
             
             if msg_type == MessageType.GROUP:
                 exclude = msg.get("exclude", [])
@@ -548,6 +576,9 @@ class Node:
             
             elif msg_type == MessageType.FILE_INIT:
                 self._handle_file_init(msg, source)
+            
+            elif msg_type == MessageType.FILE_INIT_ACK:
+                self._handle_file_init_ack(msg, source)
             
             elif msg_type == MessageType.TRANSFER_COMPLETE:
                 self._handle_transfer_complete(msg, source)
@@ -630,13 +661,49 @@ class Node:
                 self.transfer_semaphore.release()
                 return None
             
-            logger.info(f"Transfer initiated: {transfer_id}")
-            return transfer_id
+            logger.info(f"Transfer initiated: {transfer_id[:8]}, waiting for ACK...")
+            
+            # Wait for ACK with timeout
+            timeout = 10.0
+            start = time.time()
+            while time.time() - start < timeout:
+                with self.transfers_lock:
+                    if transfer_id not in self.transfers:
+                        # Transfer cancelled/failed
+                        self.transfer_semaphore.release()
+                        return None
+                    if self.transfers[transfer_id].init_confirmed:
+                        logger.info(f"Transfer {transfer_id[:8]} confirmed by receiver")
+                        return transfer_id
+                time.sleep(0.1)
+            
+            # Timeout
+            logger.error(f"No ACK received for {transfer_id[:8]}")
+            with self.transfers_lock:
+                del self.transfers[transfer_id]
+            self.transfer_semaphore.release()
+            return None
         
         except Exception as e:
             logger.error(f"Error initiating transfer: {e}")
             self.transfer_semaphore.release()
             return None
+
+    def _handle_file_init_ack(self, msg: dict, source: str):
+        """Handle ACK dari receiver"""
+        transfer_id = msg.get("transfer_id")
+        success = msg.get("success", False)
+        
+        with self.transfers_lock:
+            if transfer_id in self.transfers:
+                if success:
+                    self.transfers[transfer_id].init_confirmed = True
+                    logger.info(f"Transfer {transfer_id[:8]} ACK received")
+                else:
+                    error = msg.get("error", "Unknown error")
+                    logger.error(f"Transfer {transfer_id[:8]} rejected: {error}")
+                    del self.transfers[transfer_id]
+                    self.transfer_semaphore.release()
 
     def _handle_file_transfers(self):
         """Background thread untuk handle file transfer messages"""
@@ -654,7 +721,7 @@ class Node:
                         if len(frames) < 2:
                             continue
                         
-                        sender_id = frames[0]
+                        sender_identity = frames[0]
                         metadata = json.loads(frames[1].decode())
                         chunk_data = frames[2] if len(frames) > 2 else None
                         
@@ -665,7 +732,7 @@ class Node:
                             offset = metadata["offset"]
                             chunk_size = metadata["chunk_size"]
                             
-                            self._send_chunk(sender_id, transfer_id, offset, chunk_size)
+                            self._send_chunk(sender_identity, transfer_id, offset, chunk_size)
                         
                         elif msg_type == MessageType.CHUNK_RESPONSE:
                             if chunk_data:
@@ -674,7 +741,7 @@ class Node:
                                 chunk_md5 = metadata["chunk_md5"]
                                 
                                 self._receive_chunk(
-                                    sender_id, 
+                                    sender_identity, 
                                     transfer_id, 
                                     offset, 
                                     chunk_md5, 
@@ -688,7 +755,7 @@ class Node:
                 if self.running:
                     logger.error(f"File transfer error: {e}")
 
-    def _send_chunk(self, target_id: bytes, transfer_id: str, offset: int, chunk_size: int):
+    def _send_chunk(self, target_identity: bytes, transfer_id: str, offset: int, chunk_size: int):
         """Send requested chunk"""
         with self.transfers_lock:
             if transfer_id not in self.transfers:
@@ -719,7 +786,7 @@ class Node:
             }
             
             self.file_router_socket.send_multipart([
-                target_id,
+                target_identity,
                 json.dumps(metadata).encode(),
                 chunk
             ])
@@ -728,9 +795,9 @@ class Node:
                 if transfer_id in self.transfers:
                     self.transfers[transfer_id].chunks_sent.add(offset)
                     
-                    # Log progress setiap 10%
+                    # Log progress setiap 20%
                     progress = self.transfers[transfer_id].get_progress()
-                    if int(progress) % 10 == 0 and len(self.transfers[transfer_id].chunks_sent) % 5 == 0:
+                    if int(progress) % 20 == 0 and len(self.transfers[transfer_id].chunks_sent) % 10 == 0:
                         logger.info(f"Transfer {transfer_id[:8]}: {progress:.1f}%")
         
         except Exception as e:
@@ -769,92 +836,169 @@ class Node:
     # ========================================================================
     def _handle_file_init(self, msg: dict, source: str):
         """Handle FILE_INIT message untuk memulai receiving"""
+        logger.info(f"_handle_file_init called from {source}")
+        
         try:
+            # Validate message fields
+            required_fields = ["transfer_id", "file_name", "total_size", "chunk_size", "total_md5"]
+            if not all(field in msg for field in required_fields):
+                logger.error(f"Invalid FILE_INIT message from {source}: missing fields")
+                self._send_file_init_ack(source, msg.get("transfer_id", "unknown"), False, "Missing required fields")
+                return
+            
             transfer_id = msg["transfer_id"]
             file_name = msg["file_name"]
             total_size = msg["total_size"]
             chunk_size = msg["chunk_size"]
             total_md5 = msg["total_md5"]
             
+            # Validate peer
             with self.peers_lock:
                 if source not in self.peers:
-                    logger.error(f"Unknown sender {source}")
+                    logger.error(f"Unknown sender {source} for transfer {transfer_id[:8]}")
+                    self._send_file_init_ack(source, transfer_id, False, "Unknown sender")
                     return
                 peer = self.peers[source]
             
-            # Sanitize filename
-            safe_filename = Path(file_name).name
-            temp_path = self.temp_dir / f"temp_{transfer_id}_{safe_filename}"
-            
-            logger.info(f"Receiving: {safe_filename} ({total_size} bytes) from {source}")
-            
-            # Create receive state
-            receive_state = ReceiveState(
-                transfer_id=transfer_id,
-                file_name=safe_filename,
-                total_size=total_size,
-                chunk_size=chunk_size,
-                total_md5=total_md5,
-                sender_node=source,
-                temp_path=temp_path
-            )
-            
+            # Check for duplicate transfer
             with self.receiving_lock:
+                if transfer_id in self.receiving_transfers:
+                    logger.warning(f"Transfer {transfer_id[:8]} already exists, ignoring")
+                    self._send_file_init_ack(source, transfer_id, False, "Duplicate transfer")
+                    return
+                
+                # Acquire semaphore for incoming transfer
+                if not self.receive_semaphore.acquire(blocking=False):
+                    logger.warning(f"Max concurrent receives reached for {transfer_id[:8]}")
+                    self._send_file_init_ack(source, transfer_id, False, "Receiver at capacity")
+                    return
+                
+                # Sanitize filename
+                safe_filename = Path(file_name).name
+                temp_path = self.temp_dir / f"temp_{transfer_id}_{safe_filename}"
+                
+                logger.info(f"Receiving: {safe_filename} ({total_size} bytes) from {source}")
+                
+                # Create receive state
+                receive_state = ReceiveState(
+                    transfer_id=transfer_id,
+                    file_name=safe_filename,
+                    total_size=total_size,
+                    chunk_size=chunk_size,
+                    total_md5=total_md5,
+                    sender_node=source,
+                    temp_path=temp_path
+                )
+                
                 self.receiving_transfers[transfer_id] = receive_state
             
+            # FIX 3: Send ACK before starting thread
+            self._send_file_init_ack(source, transfer_id, True)
+            
             # Start chunk requester thread
-            thread = threading.Thread(
-                target=self._request_chunks_worker,
-                args=(peer, transfer_id),
-                name=f"ChunkReq-{transfer_id[:8]}",
-                daemon=True
-            )
-            thread.start()
+            try:
+                thread = threading.Thread(
+                    target=self._request_chunks_worker,
+                    args=(peer, transfer_id),
+                    name=f"ChunkReq-{transfer_id[:8]}",
+                    daemon=True
+                )
+                with self.receiving_lock:
+                    self.chunk_threads[transfer_id] = thread
+                thread.start()
+                logger.info(f"Started chunk requester thread for {transfer_id[:8]}")
+            
+            except Exception as e:
+                logger.error(f"Failed to start chunk requester thread for {transfer_id[:8]}: {e}")
+                with self.receiving_lock:
+                    if transfer_id in self.receiving_transfers:
+                        del self.receiving_transfers[transfer_id]
+                    if transfer_id in self.chunk_threads:
+                        del self.chunk_threads[transfer_id]
+                self.receive_semaphore.release()
+                self._send_transfer_error(source, transfer_id, f"Thread start failed: {e}")
         
         except Exception as e:
-            logger.error(f"Error handling FILE_INIT: {e}")
+            logger.error(f"Error handling FILE_INIT for {msg.get('transfer_id', 'unknown')[:8]}: {e}")
+            self.receive_semaphore.release()
+            self._send_file_init_ack(source, msg.get("transfer_id", "unknown"), False, str(e))
+
+    def _send_file_init_ack(self, target_id: str, transfer_id: str, success: bool, error: str = ""):
+        """Send FILE_INIT_ACK to sender"""
+        ack_msg = {
+            "type": MessageType.FILE_INIT_ACK.value,
+            "source": self.node_id,
+            "transfer_id": transfer_id,
+            "success": success,
+            "error": error
+        }
+        self._send_direct_message(target_id, ack_msg)
+        logger.info(f"Sent FILE_INIT_ACK for {transfer_id[:8]}: success={success}")
 
     def _request_chunks_worker(self, peer: PeerInfo, transfer_id: str):
         """Worker thread untuk request chunks dengan flow control"""
-        window_size = 20  # Request 20 chunks at a time
-        max_in_flight = 30  # Max chunks yang boleh di-request tapi belum diterima
-        timeout = 10.0  # Timeout untuk chunk
+        logger.debug(f"Chunk requester thread started for {transfer_id[:8]}")
+        
+        max_in_flight = 30
+        timeout = 5.0
+        min_window_size = 5
+        max_window_size = 50
         
         try:
             while self.running:
                 with self.receiving_lock:
                     if transfer_id not in self.receiving_transfers:
-                        logger.info(f"Transfer {transfer_id[:8]} finished")
+                        logger.info(f"Transfer {transfer_id[:8]} cancelled or finished")
                         break
                     
                     state = self.receiving_transfers[transfer_id]
                     
-                    # Check jika sudah complete
+                    # Check sender availability
+                    with self.peers_lock:
+                        if peer.node_id not in self.peers or not self.peers[peer.node_id].is_alive():
+                            logger.error(f"Sender {peer.node_id} disconnected for {transfer_id[:8]}")
+                            self._cleanup_failed_transfer(transfer_id, "Sender disconnected")
+                            break
+                    
+                    # Check if complete
                     if state.is_complete():
                         logger.info(f"All chunks received for {transfer_id[:8]}")
                         self._finalize_transfer(transfer_id, state)
                         break
                     
+                    # Adjust window size
+                    if state.success_count >= 10:
+                        success_rate = state.success_count / max(1, len(state.received_chunks))
+                        if success_rate > 0.9 and state.window_size < max_window_size:
+                            state.window_size = min(state.window_size + 5, max_window_size)
+                        elif success_rate < 0.5 and state.window_size > min_window_size:
+                            state.window_size = max(state.window_size - 5, min_window_size)
+                        state.success_count = 0
+                    
                     # Get missing chunks
                     missing = state.get_missing_chunks()
                     
-                    # Filter chunks yang belum di-request atau perlu retry
+                    # Filter chunks to request
                     to_request = []
-                    in_flight = len(state.requested_chunks - state.received_chunks.keys())
+                    current_time = time.time()
                     
                     for offset in missing:
-                        # Skip jika sudah requested dan belum timeout
-                        if offset in state.requested_chunks:
-                            # Check timeout untuk retry
-                            if time.time() - state.last_activity < timeout:
-                                continue
-                        
-                        # Limit in-flight requests
-                        if in_flight >= max_in_flight:
+                        if state.in_flight >= max_in_flight:
                             break
                         
+                        if offset in state.requested_chunks:
+                            if current_time - state.requested_chunks[offset] < timeout:
+                                continue
+                            retry_count = state.retry_count.get(offset, 0)
+                            if retry_count >= state.max_retries:
+                                logger.error(f"Max retries exceeded for chunk {offset} in {transfer_id[:8]}")
+                                self._cleanup_failed_transfer(transfer_id, f"Max retries exceeded for offset {offset}")
+                                return
+                            state.retry_count[offset] = retry_count + 1
+                            logger.info(f"Retrying chunk {offset} ({retry_count + 1}/{state.max_retries})")
+                        
                         to_request.append(offset)
-                        if len(to_request) >= window_size:
+                        if len(to_request) >= state.window_size:
                             break
                     
                     # Request chunks
@@ -867,20 +1011,27 @@ class Node:
                         }
                         
                         if self._send_file_message(peer, request):
-                            state.requested_chunks.add(offset)
-                            state.last_activity = time.time()
-                            in_flight += 1
-                
-                # Small delay
-                time.sleep(0.1)
+                            state.requested_chunks[offset] = current_time
+                            state.in_flight += 1
+                            state.last_activity = current_time
+                        else:
+                            logger.warning(f"Failed to send chunk request for offset {offset}")
+                    
+                time.sleep(0.05 if state.in_flight < max_in_flight else 0.2)
         
         except Exception as e:
-            logger.error(f"Error in chunk requester: {e}")
-            self._cleanup_failed_transfer(transfer_id, f"Request error: {e}")
+            logger.error(f"Chunk requester thread for {transfer_id[:8]} failed: {e}")
+            self._cleanup_failed_transfer(transfer_id, f"Thread error: {e}")
+        
+        finally:
+            with self.receiving_lock:
+                if transfer_id in self.chunk_threads:
+                    del self.chunk_threads[transfer_id]
+            logger.debug(f"Chunk requester thread for {transfer_id[:8]} terminated")
 
     def _receive_chunk(
         self, 
-        sender_id: bytes, 
+        sender_identity: bytes, 
         transfer_id: str, 
         offset: int, 
         chunk_md5: str, 
@@ -898,26 +1049,25 @@ class Node:
             # Verify MD5
             computed_md5 = hashlib.md5(chunk).hexdigest()
             if computed_md5 != chunk_md5:
-                logger.warning(f"MD5 mismatch at offset {offset}")
-                
-                # Retry logic
                 retry_count = state.retry_count.get(offset, 0)
                 if retry_count < state.max_retries:
                     state.retry_count[offset] = retry_count + 1
-                    state.requested_chunks.discard(offset)  # Allow re-request
-                    logger.info(f"Retry {retry_count + 1}/{state.max_retries} for offset {offset}")
+                    state.requested_chunks.pop(offset, None)
+                    logger.info(f"MD5 mismatch for chunk {offset}, retry {retry_count + 1}/{state.max_retries}")
                 else:
-                    error_msg = f"Too many retries at offset {offset}"
-                    self._cleanup_failed_transfer(transfer_id, error_msg)
+                    self._cleanup_failed_transfer(transfer_id, f"MD5 mismatch at offset {offset}")
                 return
             
             # Store chunk
             state.received_chunks[offset] = chunk
             state.chunk_md5s[offset] = chunk_md5
+            state.requested_chunks.pop(offset, None)
+            state.in_flight = max(0, state.in_flight - 1)
+            state.success_count += 1
             
             # Log progress
             progress = state.get_progress()
-            if int(progress) % 10 == 0 and len(state.received_chunks) % 5 == 0:
+            if int(progress) % 20 == 0 and len(state.received_chunks) % 10 == 0:
                 logger.info(f"Receiving {transfer_id[:8]}: {progress:.1f}%")
 
     def _finalize_transfer(self, transfer_id: str, state: ReceiveState):
@@ -935,10 +1085,8 @@ class Node:
             final_md5 = self._compute_file_md5(state.temp_path, state.chunk_size)
             
             if final_md5 == state.total_md5:
-                # Success - rename to final
                 final_path = Path(state.file_name)
                 
-                # Handle existing file
                 if final_path.exists():
                     counter = 1
                     stem = final_path.stem
@@ -958,20 +1106,17 @@ class Node:
                 logger.info(f"  Time: {elapsed:.1f}s, Speed: {speed:.2f} MB/s")
                 logger.info(f"  MD5: {final_md5}")
                 
-                # Notify sender
                 self._send_transfer_complete(state.sender_node, transfer_id)
             else:
                 error_msg = f"MD5 mismatch - expected {state.total_md5}, got {final_md5}"
                 logger.error(f"✗ Transfer {transfer_id[:8]} FAILED: {error_msg}")
                 state.temp_path.unlink()
-                
-                # Notify sender
                 self._send_transfer_error(state.sender_node, transfer_id, error_msg)
             
-            # Cleanup
             with self.receiving_lock:
                 if transfer_id in self.receiving_transfers:
                     del self.receiving_transfers[transfer_id]
+                    self.receive_semaphore.release()
         
         except Exception as e:
             logger.error(f"Error finalizing transfer: {e}")
@@ -985,14 +1130,16 @@ class Node:
             if transfer_id in self.receiving_transfers:
                 state = self.receiving_transfers[transfer_id]
                 
-                # Remove temp file
                 if state.temp_path.exists():
-                    state.temp_path.unlink()
+                    try:
+                        state.temp_path.unlink()
+                    except Exception as e:
+                        logger.error(f"Error removing temp file: {e}")
                 
-                # Notify sender
                 self._send_transfer_error(state.sender_node, transfer_id, error)
                 
                 del self.receiving_transfers[transfer_id]
+                self.receive_semaphore.release()
 
     def _send_transfer_complete(self, target_id: str, transfer_id: str):
         """Send notification bahwa transfer complete"""
@@ -1048,6 +1195,9 @@ class Node:
         """Context manager untuk dealer socket"""
         dealer = self.context.socket(zmq.DEALER)
         try:
+            # FIX 4: Set DEALER identity to node_id
+            dealer.setsockopt_string(zmq.IDENTITY, self.node_id)
+            
             port = peer.file_port if for_file else peer.router_port
             dealer.connect(f"tcp://{peer.ip}:{port}")
             dealer.setsockopt(zmq.LINGER, 0)
@@ -1065,31 +1215,39 @@ class Node:
                     return False
                 peer = self.peers[target_id]
             
+            # Add source to message
+            if "source" not in msg:
+                msg["source"] = self.node_id
+            
             with self._dealer_socket(peer) as dealer:
                 dealer.send_json(msg)
             
             return True
         
         except zmq.ZMQError as e:
-            logger.error(f"Error sending direct message: {e}")
+            logger.error(f"Error sending direct message to {target_id}: {e}")
             return False
 
     def _send_file_message(self, peer: PeerInfo, msg: dict) -> bool:
         """Send message via file channel"""
         try:
+            # Add source to message
+            if "source" not in msg:
+                msg["source"] = self.node_id
+                
             with self._dealer_socket(peer, for_file=True) as dealer:
                 dealer.send_json(msg)
             return True
         
         except zmq.ZMQError as e:
-            logger.error(f"Error sending file message: {e}")
+            logger.error(f"Error sending file message to {peer.node_id}: {e}")
             return False
 
     def _cleanup_stale_data(self):
         """Background thread untuk cleanup"""
         cleanup_interval = 10.0
         peer_timeout = 30.0
-        transfer_timeout = 120.0  # 2 minutes untuk transfers
+        transfer_timeout = 120.0
         
         while self.running:
             try:
@@ -1134,6 +1292,7 @@ class Node:
                         if state.temp_path.exists():
                             state.temp_path.unlink()
                         del self.receiving_transfers[tid]
+                        self.receive_semaphore.release()
                 
                 # Cleanup orphaned temp files
                 if self.temp_dir.exists():
@@ -1169,16 +1328,7 @@ class Node:
         exclude: Optional[list] = None,
         group_name: Optional[str] = None
     ) -> bool:
-        """
-        Send message
-        
-        Args:
-            target_id: Target node ID (for DIRECT) or None (for GROUP)
-            msg_type: Message type
-            content: Message content
-            exclude: List of node IDs to exclude (for GROUP)
-            group_name: Group name (for GROUP)
-        """
+        """Send message"""
         try:
             msg = {
                 "type": msg_type.value,
@@ -1217,12 +1367,7 @@ class Node:
             return self.peers.copy()
 
     def get_transfer_status(self) -> Tuple[Dict, Dict]:
-        """
-        Get status of active transfers
-        
-        Returns:
-            (outgoing_transfers, incoming_transfers)
-        """
+        """Get status of active transfers"""
         with self.transfers_lock:
             outgoing = {
                 tid: {
@@ -1230,7 +1375,8 @@ class Node:
                     "total_size": state.total_size,
                     "progress": state.get_progress(),
                     "chunks_sent": len(state.chunks_sent),
-                    "elapsed": time.time() - state.start_time
+                    "elapsed": time.time() - state.start_time,
+                    "confirmed": state.init_confirmed
                 }
                 for tid, state in self.transfers.items()
             }
@@ -1256,18 +1402,16 @@ class Node:
 if __name__ == "__main__":
     import sys
     
-    # Setup logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(threadName)-12s - %(levelname)-8s - %(message)s'
     )
     
-    # Gunakan command line argument untuk node ID
     node_id = sys.argv[1] if len(sys.argv) > 1 else "DummyNode"
     
     node = Node(
         node_id=node_id,
-        chunk_size=512 * 1024,  # 512KB chunks
+        chunk_size=512 * 1024,
         max_concurrent_transfers=3
     )
     
@@ -1278,10 +1422,8 @@ if __name__ == "__main__":
         
         time.sleep(3)
         
-        # Join default group
         node.join_group("general")
         
-        # Send group message
         node.send_message(
             target_id=None,
             msg_type=MessageType.GROUP,
@@ -1289,7 +1431,6 @@ if __name__ == "__main__":
             group_name="general"
         )
         
-        # Interactive loop
         logger.info("\nCommands:")
         logger.info("  peers - Show all peers")
         logger.info("  status - Show transfer status")
@@ -1314,7 +1455,7 @@ if __name__ == "__main__":
                     out, inc = node.get_transfer_status()
                     logger.info(f"\nOutgoing transfers: {len(out)}")
                     for tid, info in out.items():
-                        logger.info(f"  {tid[:8]}: {info['progress']:.1f}%")
+                        logger.info(f"  {tid[:8]}: {info['progress']:.1f}% (ACK: {info['confirmed']})")
                     
                     logger.info(f"Incoming transfers: {len(inc)}")
                     for tid, info in inc.items():
