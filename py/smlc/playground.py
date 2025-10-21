@@ -49,7 +49,7 @@ class Node(QObject):
     @Slot()
     def send_announce(self):
         if not self.started:
-            logger.warning("ERROR server not started yet")
+            logger.warning("ERROR server not running")
             return 
         logger.info(f"{self.node_id} >> Sending Payload")
         payload = {'message_type':'announce', 
@@ -59,7 +59,7 @@ class Node(QObject):
         data = json.dumps(payload)
         for group in self.m_groups:
             self.udpSocket.writeDatagram(data.encode(), QHostAddress(group), 55655)
-        # self.udpSocket.writeDatagram(data.encode(), QHostAddress('255.255.255.255'), 55655)
+        self.udpSocket.writeDatagram(data.encode(), QHostAddress('255.255.255.255'), 55655)
 
     @Slot()
     def start(self):
@@ -97,9 +97,9 @@ class Node(QObject):
                     return
                 lock = QMutexLocker(self.peers_mutex)
                 if payload['node_id'] not in self.peers.keys():
-                    logger.info(f"Discovered peer [{peer_node_id}]@{peer_ip_addr}:{peer_port_addr}")
+                    logger.info(f"Discovered peer :\n[{peer_node_id}]@{peer_ip_addr}:{peer_port_addr}")
                     peer_id = payload['node_id']
-                    self.peers[node_id] = (payload['ip_addr'], payload[port_addr], QDateTime.currentDateTime())
+                    self.peers[peer_id] = (payload['ip_addr'], payload['port_addr'], QDateTime.currentDateTime())
                     return
 
     @Slot()
@@ -124,5 +124,7 @@ if __name__ == "__main__":
     node2 = Node("Node2")
     node1.start()
     node2.start()
-    QTimer.singleShot(60000, app.quit)
+    QTimer.singleShot(10000, node2.stop)
+    QTimer.singleShot(10000, node1.stop)
+    QTimer.singleShot(30000, app.quit)
     app.exec()
