@@ -75,10 +75,15 @@
          <number>0</number>
         </property>
         <item>
-         <widget class="NavigationTree" name="treeView">
+         <widget class="NavigationTree" name="treeWidget">
           <property name="rootIsDecorated">
            <bool>false</bool>
           </property>
+          <column>
+           <property name="text">
+            <string notr="true">1</string>
+           </property>
+          </column>
          </widget>
         </item>
         <item>
@@ -104,7 +109,7 @@
  <customwidgets>
   <customwidget>
    <class>NavigationTree</class>
-   <extends>QTreeView</extends>
+   <extends>QTreeWidget</extends>
    <header>custom_ui/navigationtree.h</header>
   </customwidget>
  </customwidgets>

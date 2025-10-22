@@ -22,13 +22,15 @@ class DumbChatWindow(QMainWindow):
         super().__init__(parent)
         self.ui = ui_dumb()
         self.ui.setupUi(self)
-        cmenu = self.ui.treeView
+        cmenu = self.ui.treeWidget
         cmenu.setHeaderHidden(1)
         cmenu.addCategory("Chat")
+        cmenu.setBadge("Chat", "20")
+        cmenu.addCategory("Folder")
 
 if __name__ == "__main__":
     app = QApplication([])
-    # app.setStyle("Fusion")
+    app.setStyle("Fusion")
     dumb = DumbChatWindow()
     dumb.show()
     app.exec()
