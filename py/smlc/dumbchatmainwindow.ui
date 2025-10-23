@@ -75,29 +75,11 @@
          <number>0</number>
         </property>
         <item>
-         <widget class="NavigationTree" name="treeWidget">
+         <widget class="NavigationTree" name="treeView">
           <property name="rootIsDecorated">
            <bool>false</bool>
           </property>
-          <column>
-           <property name="text">
-            <string notr="true">1</string>
-           </property>
-          </column>
          </widget>
-        </item>
-        <item>
-         <spacer name="verticalSpacer">
-          <property name="orientation">
-           <enum>Qt::Orientation::Vertical</enum>
-          </property>
-          <property name="sizeHint" stdset="0">
-           <size>
-            <width>20</width>
-            <height>255</height>
-           </size>
-          </property>
-         </spacer>
         </item>
        </layout>
       </widget>
@@ -109,7 +91,7 @@
  <customwidgets>
   <customwidget>
    <class>NavigationTree</class>
-   <extends>QTreeWidget</extends>
+   <extends>QTreeView</extends>
    <header>custom_ui/navigationtree.h</header>
   </customwidget>
  </customwidgets>

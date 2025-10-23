@@ -1,52 +1,32 @@
-from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QWidget, \
+from PySide6.QtWidgets import QTreeView, QTreeWidgetItem, QStyledItemDelegate, QWidget, QToolButton, QPushButton, \
                                 QHBoxLayout, QLabel, QApplication
-from PySide6.QtCore import Slot, Qt
+from PySide6.QtCore import Slot, Qt, QSize
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 
 import logging
 
 log = logging.getLogger(__name__)
 
-class TreeHeaderWidget(QWidget):
-    
-    def __init__(self, lab, parent=None):
-        super().__init__(parent)
-        self.carret = QLabel(">", self)
-        self.text = QLabel(lab, self)
-        # self.text.setAlignment(Qt.Alignment.AlignCenter)
-        self.badge = QLabel("", self)
-        self.badge.setMinimumWidth(40)
-        
-        layout = QHBoxLayout()
-        layout.addWidget(self.carret)
-        layout.addWidget(self.text, 1)
-        layout.addWidget(self.badge)
-        self.setLayout(layout)
-    
-    @Slot(str)
-    def setBadge(self, b):
-        self.badge.setText("4")
-    
 
-class NavigationTree(QTreeWidget):
+class NavigationTree(QTreeView):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.itemWidgets = {}
+        self._model = QStandardItemModel(0, 1, self)
+        self.setModel(self._model)
         
     @Slot(str)
     def addCategory(self, cat_name):
-        item = QTreeWidgetItem(self, 1001)
-        self.addTopLevelItem(item)
-        hw = TreeHeaderWidget(cat_name)
-        self.itemWidgets[cat_name] = hw
-        self.setItemWidget(item, 0, hw)
-    
+        item = QStandardItem(cat_name)
+        item.setEditable(False)
+        item.setSelectable(False)
+        item.setSizeHint(QSize(200, 40))
+        self._model.appendRow(item)
+
     @Slot(str, str)
     def setBadge(self, wn, bdg):
-        if wn in self.itemWidgets:
-            self.itemWidgets[wn].setBadge(bdg)
-    
-    @Slot(str, str)
-    def addCategoryItem(self, cat, name):
+        pass
+
+    @Slot(str)
+    def addChatPeer(self, name):
         pass

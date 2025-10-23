@@ -134,11 +134,13 @@ class ReceiveState:
 # MAIN NODE CLASS
 # ============================================================================
 class Node(QObject):
-    
     """
     P2P Node dengan reliable file transfer support
     """
     
+    peerDiscovered = Signal(PeerInfo)
+    peerDisconnected = Signal(PeerInfo)
+
     def __init__(
         self, 
         node_id: Optional[str] = None,
@@ -495,6 +497,7 @@ class Node(QObject):
                         if is_new:
                             self.sub_socket.connect(f"tcp://{peer['ip']}:{peer_info.pub_port}")
                             logger.info(f"Discovered peer: {peer['node_id']} at {peer['ip']}")
+                            self.peerDiscovered.emit(peer_info)
 
                 except socket.timeout:
                     pass
@@ -1293,6 +1296,7 @@ class Node(QObject):
                     
                     for peer_id in dead_peers:
                         logger.info(f"Removing dead peer: {peer_id}")
+                        self.peerDisconnected(self.peers[peer_id])
                         del self.peers[peer_id]
                 
                 # Cleanup stale outgoing transfers
