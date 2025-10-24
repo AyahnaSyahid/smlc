@@ -2,9 +2,9 @@ from PySide6.QtWidgets import QListView, QWidget, QLabel, QPushButton
 from PySide6.QtCore import QStandardItemModel, QDateTime
 
 
-class ChatItemWidget(QWidget):
-    
-    
+class ChatItemWidget(QFrame):
+
+
     def __init__(self, parent=None):
         super().__init__(parent)
         profileIcon = QLabel(self)
