@@ -15,7 +15,7 @@ class MessageDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.padding = 4
+        self.padding = 20
         self.bubble_margin = 5
         self.max_bubble_width_ratio = 0.7  # Lebar maksimum 70% dari view
         self.min_bubble_width = 0.6        # Lebar minimum 40% dari view
@@ -36,8 +36,9 @@ class MessageDelegate(QStyledItemDelegate):
         fTime.setPointSize(9)
 
         # Hitung lebar maksimum dan minimum bubble
-        max_width = min(opt.rect.width(), opt.rect.width() * self.max_bubble_width_ratio)
-        min_width = int(opt.rect.width() * self.min_bubble_width)
+        item_width = opt.rect.width()
+        bubble_area_width = item_width - 2 * self.padding
+        
         fm_header = QFontMetrics(fHeader)
         fm_message = QFontMetrics(fMessage)
         fm_time = QFontMetrics(fTime)
@@ -48,15 +49,15 @@ class MessageDelegate(QStyledItemDelegate):
         time_text = ix.data(self.TimeStringRole) or "00:00"
 
         # Hitung lebar dan tinggi teks
-        header_rect = fm_header.boundingRect(0, 0, max_width - 2 * self.padding, 0, Qt.AlignLeft, header_text)
-        message_rect = fm_message.boundingRect(0, 0, max_width - 2 * self.padding, 0, 
+        header_rect = fm_header.boundingRect(0, 0, bubble_area_width, 0, Qt.AlignLeft, header_text)
+        message_rect = fm_message.boundingRect(0, 0, bubble_area_width, 0, 
                                                Qt.AlignLeft | Qt.TextWordWrap, message_text)
-        time_rect = fm_time.boundingRect(0, 0, max_width - 2 * self.padding, 0, Qt.AlignLeft, time_text)
+        time_rect = fm_time.boundingRect(0, 0, bubble_area_width, 0, Qt.AlignLeft, time_text)
 
         # Hitung lebar berdasarkan konten
-        content_width = max(header_rect.width(), message_rect.width(), time_rect.width())
-        bubble_width = content_width + 2 * self.padding
-        bubble_width = max(min_width, min(bubble_width, max_width))  # Terapkan batas minimum dan maksimum
+        content_width = max(header_rect.width(), message_rect.width())
+        content_width += time_rect.width()
+        bubble_width = content_width
 
         # Hitung tinggi
         height = fm_header.lineSpacing()  if header_text else 0 # Header
@@ -66,7 +67,7 @@ class MessageDelegate(QStyledItemDelegate):
             height += 250
         height += 2 * self.padding        # Padding atas dan bawah
 
-        return QSize(bubble_width + 2 * self.bubble_margin, height)
+        return QSize(bubble_width, height)
 
     def paint(self, painter, opt, index):
         painter.save()
@@ -75,14 +76,14 @@ class MessageDelegate(QStyledItemDelegate):
         # Ambil ukuran dari sizeHint
         size = self.sizeHint(opt, index)
         is_sender = index.data(self.SenderRole)  # True untuk pengirim, False untuk penerima
-
+        
         # Tentukan posisi bubble
         if is_sender:
-            bubble_x = opt.rect.right() - size.width() - self.bubble_margin
+            bubble_x = opt.rect.right() - size.width()
         else:
-            bubble_x = opt.rect.left() + self.bubble_margin
-        bubble_rect = QRect(bubble_x, opt.rect.top(), size.width() - 2 * self.bubble_margin, size.height())
-
+            bubble_x = opt.rect.left()
+        bubble_rect = QRect(bubble_x, opt.rect.top(), size.width() , size.height())
+        painter.drawRect(bubble_rect)
         # Gambar bubble dengan tiga sudut membulat
         path = QPainterPath()
         radius = self.corner_radius
