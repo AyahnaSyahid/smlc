@@ -7,26 +7,32 @@ logger = logging.getLogger(__name__)
 
 class MessageDelegate(QStyledItemDelegate):
     # Definisi konstanta role
-    MessageRole = 1250
-    TimeStringRole = 1251
-    MessageHeaderRole = 1252
-    ImageAttachmentRole = 1253
-    SenderRole = 1254
+    SenderRole = 1201
+    TextRole   = 1202
+    InfoRole   = 1203
+    PixmapRole   = 1204
+    PixmapDataRole   = 1204
+    FileRole   = 1204
+    LocalFileRole = 
+    PathFileRole =
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.padding = 20
+        self.padding = 2
+        self.item_margin = 50
         self.bubble_margin = 5
         self.max_bubble_width_ratio = 0.7  # Lebar maksimum 70% dari view
         self.min_bubble_width = 0.6        # Lebar minimum 40% dari view
         self.corner_radius = 10            # Radius sudut membulat
+        logging.info("MessageDelegate Created")
 
     def sizeHint(self, opt, ix):
+        # logging.info("MessageDelegate::sizeHint Called")
         font = ix.data(Qt.ItemDataRole.FontRole) or opt.font
         if not isinstance(font, QFont):
             logging.debug("Unable to get font")
             font = QApplication.instance().font()
-
+        
         # Font untuk header, pesan, dan waktu
         fHeader = QFont(font)
         fHeader.setPointSize(8)
@@ -36,8 +42,10 @@ class MessageDelegate(QStyledItemDelegate):
         fTime.setPointSize(9)
 
         # Hitung lebar maksimum dan minimum bubble
-        item_width = opt.rect.width()
-        bubble_area_width = item_width - 2 * self.padding
+        item_rect = opt.rect
+        bubble_area = QRect(item_rect.x() + self.item_margin, 0, item_rect.width() - 2 * self.item_margin, item_rect.height())
+        # logging.info("MessageDelegate::sizeHint line 44")
+        content_area = bubble_area.adjusted(5, 5, -5, -5)
         
         fm_header = QFontMetrics(fHeader)
         fm_message = QFontMetrics(fMessage)
@@ -49,25 +57,33 @@ class MessageDelegate(QStyledItemDelegate):
         time_text = ix.data(self.TimeStringRole) or "00:00"
 
         # Hitung lebar dan tinggi teks
-        header_rect = fm_header.boundingRect(0, 0, bubble_area_width, 0, Qt.AlignLeft, header_text)
-        message_rect = fm_message.boundingRect(0, 0, bubble_area_width, 0, 
+        header_rect = fm_header.boundingRect(content_area, Qt.AlignLeft, header_text)
+        header_height = fm_header.lineSpacing() if header_text else 0
+        message_rect = fm_message.boundingRect(content_area.adjusted(header_height, 0, 0, 0), 
                                                Qt.AlignLeft | Qt.TextWordWrap, message_text)
-        time_rect = fm_time.boundingRect(0, 0, bubble_area_width, 0, Qt.AlignLeft, time_text)
+        time_rect = fm_time.boundingRect(content_area, Qt.AlignLeft, time_text)
 
         # Hitung lebar berdasarkan konten
-        content_width = max(header_rect.width(), message_rect.width())
-        content_width += time_rect.width()
-        bubble_width = content_width
+        header_rect.moveLeft(content_area.left() + 5)
+        header_rect.moveTop(content_area.top() + 5)
+        message_rect.moveLeft(header_rect.left())
+        message_rect.moveTop(header_rect.top())
+        if len(header_text):
+            message_rect.moveTop(header_rect.bottom())
+        time_rect.moveLeft(message_rect.right())
+        time_rect.moveTop(message_rect.bottom() - int(time_rect.height() / 2))
 
         # Hitung tinggi
-        height = fm_header.lineSpacing()  if header_text else 0 # Header
-        height += message_rect.height()    # Pesan
-        height += fm_time.lineSpacing()    # Waktu
-        if ix.data(self.ImageAttachmentRole):  # Attachment
-            height += 250
-        height += 2 * self.padding        # Padding atas dan bawah
-
-        return QSize(bubble_width, height)
+        res = QRect(header_rect.left(), header_rect.top(), time_rect.right() - header_rect.left(), time_rect.bottom() - header_rect.top())
+        
+        if ix.data(MessageDelegate.ImageAttachmentRole):
+            size = ix.data(MessageDelegate.ImageSizeRole)
+            # print(size)
+            size.scale(250, 250, Qt.AspectRatioMode.KeepAspectRatio)
+            res.setBottom(res.bottom() + size.height())
+            res.setWidth(max(res.width(), size.width()))
+        # print(res)
+        return res.adjusted(-5, -5, 5, 5).size()
 
     def paint(self, painter, opt, index):
         painter.save()
@@ -82,13 +98,14 @@ class MessageDelegate(QStyledItemDelegate):
             bubble_x = opt.rect.right() - size.width()
         else:
             bubble_x = opt.rect.left()
+
         bubble_rect = QRect(bubble_x, opt.rect.top(), size.width() , size.height())
-        painter.drawRect(bubble_rect)
+        
         # Gambar bubble dengan tiga sudut membulat
         path = QPainterPath()
         radius = self.corner_radius
         x, y, w, h = bubble_rect.x(), bubble_rect.y(), bubble_rect.width(), bubble_rect.height()
-
+        print(f'{size.height()=}')
         if is_sender:
             # Sudut kanan atas lancip, lainnya membulat
             path.moveTo(x + radius, y)
@@ -147,8 +164,11 @@ class MessageDelegate(QStyledItemDelegate):
 
         # Gambar attachment (jika ada)
         if index.data(self.ImageAttachmentRole):
-            painter.drawRect(QRect(text_x, y, text_width, 250))  # Placeholder untuk gambar
-            y += 250
+            size = index.data(MessageDelegate.ImageSizeRole)
+            size.scale(250, 250, Qt.AspectRatioMode.KeepAspectRatio)
+            image_rect = QRect(bubble_rect.left(), bubble_rect.top(), size.width(), size.height())
+            painter.drawRect(image_rect.adjusted(10, 10, 0, 0))  # Placeholder untuk gambar
+            y += size.height()
        
        # Gambar pesan
         painter.setFont(fMessage)
@@ -156,10 +176,10 @@ class MessageDelegate(QStyledItemDelegate):
         painter.drawText(message_rect, Qt.AlignLeft | Qt.TextWordWrap, message_text)
         y += message_rect.height()
 
-
         # Gambar waktu
+        time_str_width = fm_time.horizontalAdvance(time_text)
         painter.setFont(fTime)
-        painter.drawText(QRect(text_x, y, text_width, fm_time.lineSpacing()), Qt.AlignRight, time_text)
+        painter.drawText(QRect(bubble_rect.right() - time_str_width + 5, message_rect.bottom() - 10, 50, fm_time.lineSpacing()), Qt.AlignLeft, time_text)
 
         painter.restore()
 
@@ -168,6 +188,7 @@ class MessageDelegate(QStyledItemDelegate):
 if __name__ == "__main__":
     import random
     from PySide6.QtGui import QStandardItemModel, QStandardItem 
+    logging.basicConfig(level=logging.DEBUG)
     app = QApplication([])
     app.setStyle("Fusion")
     model = QStandardItemModel(0, 1, app)
@@ -177,7 +198,11 @@ if __name__ == "__main__":
         # item.setData(f"Header {i}", MessageDelegate.MessageHeaderRole)
         item.setData("12:00", MessageDelegate.TimeStringRole)
         item.setData(i % 2 == 0, MessageDelegate.SenderRole)  # Pengirim jika genap, penerima jika ganjil
-        item.setData(i % random.choices([1, 2, 3, 4, 5])[0], MessageDelegate.ImageAttachmentRole)  # Attachment jika ganjil
+        hasAttachment = i % random.choices([1, 2, 3, 4, 5])[0]
+        item.setData( hasAttachment, MessageDelegate.ImageAttachmentRole)  # Attachment jika ganjil
+        if hasAttachment:
+            item.setData( QSize(500, 200), MessageDelegate.ImageSizeRole)  # Attachment jika ganjil
+            
         model.appendRow(item)
     view = QListView()
     delegate = MessageDelegate()
